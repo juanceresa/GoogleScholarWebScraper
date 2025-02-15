@@ -1,309 +1,338 @@
 import re
+import unidecode
+from crossref.restful import Works, Etiquette
 import requests
-from crossref.restful import Works
 
-def name_variations(full_name):
+COMMON_INSTITUTION_WORDS = {
+    "universidad", "university", "college", "institute", "instituto",
+    "institut", "facultad", "escuela", "politecnica", "autonoma", "superior",
+    "council"
+}
+
+def parse_spanish_name(full_name):
     """
-    Given a full name string like 'Rebeca Acin Perez',
-    produce a list of possible variations, e.g.:
-      - 'rebeca acin perez'
-      - 'acin perez'
-      - 'acin-perez'
-      - 'perez'
-    Removes duplicates by converting to a set, then back to list.
+    Splits 'full_name' into (first_names, paternal_last, maternal_last).
+    For example, "Cándida Acín Sáiz" becomes:
+         first_names = ["cándida"]
+         paternal_last = "acín"
+         maternal_last = "sáiz"
+    If there is only one last name, maternal_last will be None.
     """
-    parts = full_name.lower().split()
-    # Variation 1: full name
-    variations = [" ".join(parts)]
+    tokens = full_name.lower().split()
+    if len(tokens) < 2:
+        return tokens, None, None
+    first_names = [tokens[0]]
+    if len(tokens) == 2:
+        return first_names, tokens[1], None
+    else:
+        return first_names, tokens[-2], tokens[-1]
 
-    # Variation 2: just last names
-    if len(parts) >= 2:
-        last_names = parts[1:]
-        # e.g. "acin perez"
-        variations.append(" ".join(last_names))
-
-        # e.g. "acin-perez"
-        if len(last_names) > 1:
-            variations.append("-".join(last_names))
-
-        # e.g. "perez"
-        if len(last_names) > 1:
-            variations.append(last_names[-1])
-
-    # Make them unique
-    return list(set(variations))
-
-def matched_name_in_author(author, full_name):
+def spanish_name_match_combined(author, user_full_name, debug=False):
     """
-    Returns True if *any* variation of 'full_name' is fully matched in the
-    author's name fields. We:
-      1) generate name_variations(full_name)
-      2) gather author_name from 'given', 'family', or 'literal'
-      3) for each variation, split into tokens and check if *all* appear
-         in author_name
-
-    This is stricter than a naive substring check, but still uses your
-    existing permutations for partial last names, hyphens, etc.
+    Matches Spanish names using a "combined last name" approach.
+    It requires that:
+      - The user's primary first name appears in the author's 'given' field.
+      - At least one token from the combined last name appears in the author's 'family' field.
     """
-    # Prepare the author's combined name fields
-    given = (author.get('given')   or '').lower()
-    fam   = (author.get('family')  or '').lower()
-    lit   = (author.get('literal') or '').lower()
-    author_name = (given + " " + fam + " " + lit).strip()
+    # Parse the user's name
+    user_first, paternal, maternal = parse_spanish_name(user_full_name)
+    if debug:
+        print(f"DEBUG: Parsed user name: first={user_first}, paternal={paternal}, maternal={maternal}")
+    if not paternal:
+        return False
 
-    # Generate all permutations from the input name
-    possible_forms = name_variations(full_name)
+    # Build the combined last name string.
+    combined_last = paternal
+    if maternal:
+        combined_last += " " + maternal
+    # Normalize: remove accents, lowercase, replace hyphens with spaces.
+    combined_last_norm = unidecode.unidecode(combined_last.lower()).replace('-', ' ')
+    combined_tokens = combined_last_norm.split()
 
-    # For each variation, we require *all tokens* to be present
-    # in the author's name fields:
-    for variation in possible_forms:
-        form_tokens = variation.split()
-        # e.g. 'rebeca acin perez' -> ['rebeca','acin','perez']
-        if all(token in author_name for token in form_tokens):
-            return True
+    # Get author's name fields.
+    given  = unidecode.unidecode((author.get('given') or '').lower())
+    family = unidecode.unidecode((author.get('family') or '').lower()).replace('-', ' ')
 
+    if debug:
+        print(f"DEBUG: Checking author => given='{given}', family='{family}'")
+        if user_first:
+            print(f"DEBUG: User primary first: {user_first[0]}")
+        print(f"DEBUG: Combined last tokens: {combined_tokens}")
+
+    # Check that the user's primary first name is present in the author's given field.
+    if user_first:
+        if user_first[0] not in given:
+            if debug:
+                print(f"DEBUG: FAIL => first token '{user_first[0]}' not in '{given}'")
+            return False
+
+    # Require that at least one token from the combined last name is found in family.
+    match_count = sum(1 for token in combined_tokens if token in family)
+    if debug:
+        print(f"DEBUG: Found {match_count} of {len(combined_tokens)} last name tokens in '{family}'")
+    if match_count < 1:
+        if debug:
+            print(f"DEBUG: FAIL => none of the tokens {combined_tokens} found in '{family}'")
+        return False
+
+    if debug:
+        print("DEBUG: SUCCESS: name matched")
+    return True
+
+def tokenize_name_fields(*fields):
+    """
+    Combines multiple name strings (e.g., 'given' and 'family'), normalizes them,
+    replaces hyphens with spaces, and returns a list of tokens.
+    Example:
+      tokenize_name_fields("Rebeca", "acin-perez") -> ["rebeca", "acin", "perez"]
+    """
+    combined = " ".join(fields).lower()
+    combined = unidecode.unidecode(combined)  # Remove accents
+    combined = combined.replace("-", " ")     # Replace hyphens with space
+    combined = re.sub(r"[^\w\s]", "", combined) # Remove punctuation
+    tokens = combined.split()
+    return tokens
+
+def name_tokens_exact_match(author, user_full_name, debug=False):
+    """
+    Checks if combining author['given'] and author['family'] (after tokenizing)
+    matches exactly the tokens from 'user_full_name'.
+    E.g.:
+      user_full_name: "rebeca acin perez"
+      author: { "given": "Rebeca", "family": "acin-perez" }
+      Both become set(["rebeca", "acin", "perez"]) and match exactly.
+    """
+    author_tokens = tokenize_name_fields(author.get("given", ""), author.get("family", ""))
+    user_tokens   = tokenize_name_fields(user_full_name)
+    if debug:
+        print(f"DEBUG: Exact token match => author tokens: {author_tokens}, user tokens: {user_tokens}")
+    if set(author_tokens) == set(user_tokens):
+        if debug:
+            print("DEBUG: EXACT MATCH => success")
+        return True
+    if debug:
+        print("DEBUG: EXACT MATCH => fail")
     return False
 
+def any_author_matches_name(item, full_name, debug=False):
+    authors = item.get("author", [])
+    for au in authors:
+        if spanish_name_match_combined(au, full_name, debug=debug):
+            return True
+    return False
 
-def get_publication_year(item):
+def normalize_institution_name(name):
     """
-    Extract publication year from different CrossRef fields (issued, published-print, published-online).
-    Returns None if not found.
+    Normalizes an institution name by lowercasing, removing punctuation/accents,
+    and dropping common filler words. Returns a list of tokens.
     """
-    for field in ["issued", "published-print", "published-online"]:
-        data = item.get(field, {})
-        if "date-parts" in data and data["date-parts"]:
-            return data["date-parts"][0][0]  # e.g., [[2020, 7, 15]]
+    name = name.lower()
+    name = re.sub(r"[-]", " ", name)
+    name = re.sub(r"[^\w\s]", "", name)
+    name = unidecode.unidecode(name)
+    tokens = name.split()
+    filtered = [t for t in tokens if t not in COMMON_INSTITUTION_WORDS]
+    return filtered
+
+def institution_match(institution, aff_str):
+    """
+    Returns True if any token from 'institution' (after normalization)
+    appears in 'aff_str' (after normalization).
+    """
+    inst_tokens = normalize_institution_name(institution)
+    aff_tokens  = normalize_institution_name(aff_str)
+    if not inst_tokens:
+        return False
+    return any(t in aff_tokens for t in inst_tokens)
+
+def check_affiliation_or_publisher(item, institution_name):
+    """
+    Returns True if any author affiliation or the publisher field contains
+    any token from institution_name.
+    """
+    authors = item.get("author", [])
+    for au in authors:
+        for aff in au.get("affiliation", []):
+            aff_name = aff.get("name", "")
+            if institution_match(institution_name, aff_name):
+                return True
+    publisher_str = item.get("publisher", "")
+    if institution_match(institution_name, publisher_str):
+        return True
+    return False
+
+def get_created_year(item):
+    """
+    Returns the year from the item's 'created' field.
+    For example, if item['created']['date-parts'] = [[2020, 7, 12]],
+    returns 2020.
+    """
+    created_data = item.get("created", {})
+    date_parts = created_data.get("date-parts", [])
+    if date_parts and len(date_parts[0]) > 0:
+        return date_parts[0][0]
     return None
 
-# Function to search Google Scholar for a profile (Using Web Unblocker)
+def check_created_year_in_range(item, scholarship_year, delta=5):
+    """
+    Returns True if the item's created year is within ±delta of scholarship_year.
+    """
+    cyear = get_created_year(item)
+    if cyear is None:
+        return False
+    return (scholarship_year - delta) <= cyear <= (scholarship_year + delta)
+
+def compute_similarity_score(item, full_name, institution_name, scholarship_year, debug=False):
+    """
+    Computes a score:
+      +1 for a name match (using our Spanish combined-name match),
+      +1 if the affiliation or publisher matches the institution,
+      +1 if the created year is within ±5 years of scholarship_year.
+    If no name match is found, returns -999.
+    """
+    if not any_author_matches_name(item, full_name, debug=debug):
+        if debug:
+            print("DEBUG: Name did not match; score = -999")
+        return -999
+    score = 1  # name match
+    if check_affiliation_or_publisher(item, institution_name):
+        score += 1
+    if check_created_year_in_range(item, scholarship_year, delta=5):
+        score += 1
+    if debug:
+        print(f"DEBUG: Computed similarity score = {score}")
+    return score
+
+def search_doi(name_query, given_name, scholarship_year, institution_name, debug=False):
+    """
+    Uses CrossRef to query for works by the author.
+    We build the query using the combined last names only, then score each item
+    (using the full name as 'given_name apellido1 apellido2').
+
+    Returns ONLY ONE DOI:
+      - If any item has a similarity score >= 2, return the one with the highest score.
+      - Otherwise, fallback to an exact token match (combining the author's 'given'
+        and 'family' fields with hyphens removed) and return that DOI.
+      - If none are found, returns None.
+    """
+    # Build the combined last name query from 'name_query'
+    _, apellido1_parsed, apellido2_parsed = parse_spanish_name(name_query)
+    last_name_query = apellido1_parsed if apellido1_parsed else ""
+    if apellido2_parsed:
+        last_name_query += " " + apellido2_parsed
+
+    # Build full name for matching (e.g., "Rebeca Acin Perez")
+    full_name = f"{given_name} {last_name_query}".strip()
+
+    my_etiquette = Etiquette(
+        'GoogleScholarWebScraper', '1.0',
+        'https://github.com/juanceresa/GoogleScholarWebScraper',
+        'jcere@umich.edu'
+    )
+    works = Works(etiquette=my_etiquette)
+
+    if debug:
+        print(f"DEBUG: CROSSREF => searching for author last names='{last_name_query}' (limit 100 rows)...")
+
+    # Query CrossRef (sample up to 100 results)
+    results = works.query(author=last_name_query).sample(100)
+
+    scored_items = []       # list of tuples: (score, item)
+    exact_match_items = []  # items with an exact token match on the name
+
+    for item in results:
+        title = item.get("title")
+        title_str = title[0] if title and len(title) > 0 else "N/A"
+        if debug:
+            print(f"DEBUG: Checking item => DOI='{item.get('DOI')}', TITLE='{title_str}'")
+
+        # Compute similarity score
+        sc = compute_similarity_score(item, full_name, institution_name, scholarship_year, debug=debug)
+        if sc > 0:
+            scored_items.append((sc, item))
+
+        # Check for exact token match based on combined given+family fields
+        authors = item.get("author", [])
+        for au in authors:
+            if name_tokens_exact_match(au, full_name, debug=debug):
+                exact_match_items.append(item)
+                break
+
+    # Sort scored items by descending score
+    scored_items.sort(key=lambda x: x[0], reverse=True)
+    # Filter for items with score >= 2
+    best_scored = [(sc, it) for (sc, it) in scored_items if sc >= 2]
+
+    if best_scored:
+        best_score, best_item = best_scored[0]
+        doi_val = best_item.get("DOI")
+        if doi_val:
+            return [{"doi": f"https://doi.org/{doi_val}", "score": best_score}]
+        else:
+            return None
+
+    # Fallback: if no item with score >= 2, use the exact token match approach.
+    if exact_match_items:
+        fallback_item = exact_match_items[0]
+        doi_val = fallback_item.get("DOI")
+        if doi_val:
+            return [{"doi": f"https://doi.org/{doi_val}", "score": 1}]
+        else:
+            return None
+
+    return None
+
 def search_google_scholar(name_query, scraper_api_url, scraper_user, scraper_pass, unblock_proxy):
     """
-    Search Google Scholar for a given name and return a profile URL (if found).
-    This version tries to handle the 'User profiles for X' result more reliably.
+    Searches Google Scholar for a user profile using Oxylabs Real-Time Crawler.
+    Returns a profile URL if found.
     """
+    # We do a simple check for the first word of the name or the entire name.
+    name_lower = name_query.lower()
+    first_word = name_lower.split()[0]
+
     search_url = f"https://scholar.google.com/scholar?q={name_query.replace(' ', '+')}"
-    payload = {
-        "source": "google",
-        "url": search_url,
-        "parse": True,
-    }
+    payload = {"source": "google", "url": search_url, "parse": True}
 
     try:
-        # Send request using Web Unblocker + Oxylabs Real-Time Crawler
         response = requests.post(
-            scraper_api_url,  # e.g. "https://realtime.oxylabs.io/v1/queries"
+            scraper_api_url,
             auth=(scraper_user, scraper_pass),
             json=payload,
             proxies={"http": unblock_proxy, "https": unblock_proxy},
-            verify=False,  # per Oxylabs' docs
+            verify=False,
             timeout=20
         )
-
         if response.status_code == 200:
             data = response.json()
             results = data.get("data", {}).get("results", [])
-
             for result in results:
                 title = result.get("title", "")
+                snippet = result.get("snippet", "")
                 link = result.get("link", "")
 
-                # 1) Check explicitly for the "User profiles for X" pattern
-                if "User profiles for" in title.lower():
-                    # Sometimes the direct link is not in result["link"] but in nested fields
-                    # so we check all known link fields:
-                    possible_links = set()
+                # Convert to lowercase for easier matching
+                title_lower = title.lower()
+                snippet_lower = snippet.lower()
 
-                    # Main link
-                    if link:
-                        possible_links.add(link)
-
-                    # Check if there's a list of sub-links, inline links, etc.
-                    # (The structure may differ depending on Oxylabs parse format)
-                    # For example:
-                    inline_links = result.get("inlineLinks", [])
-                    for item in inline_links:
-                        sub_link = item.get("link", "")
-                        if sub_link:
-                            possible_links.add(sub_link)
-
-                    related_urls = result.get("relatedUrls", [])
-                    for item in related_urls:
-                        sub_link = item.get("link", "")
-                        if sub_link:
-                            possible_links.add(sub_link)
-
-                    # Now see if any link looks like a Google Scholar citations profile
-                    for plink in possible_links:
-                        if "scholar.google.com/citations?" in plink:
-                            return plink  # Return first user-profile link found
-
-                # 2) Fallback: if the link itself has the scholar citations pattern
+                # Check if "user profiles for" appears in the title or snippet
+                if "user profiles for" in title_lower or "user profiles for" in snippet_lower:
+                    if name_lower in title_lower or name_lower in snippet_lower or first_word in snippet_lower:
+                        possible_links = set()
+                        if link:
+                            possible_links.add(link)
+                        for sub in result.get("inlineLinks", []):
+                            if sub.get("link"):
+                                possible_links.add(sub["link"])
+                        for sub in result.get("relatedUrls", []):
+                            if sub.get("link"):
+                                possible_links.add(sub["link"])
+                        for plink in possible_links:
+                            if "scholar.google.com/citations?" in plink:
+                                return plink
                 if "scholar.google.com/citations?" in link:
                     return link
-
     except Exception as e:
         print(f"Error fetching Google Scholar profile for {name_query}: {e}")
-
     print(f"No profile found for {name_query}")
     return None
-
-def search_doi(name_query, scholarship_year, institution_name):
-    """
-    1. Queries CrossRef by author's name, sorted by 'score' desc.
-    2. Finds up to 3 DOIs within ±5 years of scholarship_year with an author whose
-       full name contains name_query, and if the institution matches, marks status='OK'.
-       If the institution doesn't match, 'status'='additional checking required'.
-    3. If no such DOIs found, we return top 3 'fallback' DOIs (label them 'base case (most cited articles)').
-    Returns a list of up to 3 dicts with structure: {"doi": ..., "status": ...}.
-    """
-    crossref_url = (
-        "https://api.crossref.org/works"
-        f"?query.author={name_query.replace(' ', '+')}"
-        "&sort=score&order=desc"
-    )
-
-    valid_dois = []
-    fallback_dois = []
-
-    try:
-        response = requests.get(crossref_url, timeout=20)
-        if response.status_code == 200:
-            items = response.json().get("message", {}).get("items", [])
-
-            for item in items:
-                pub_year = get_publication_year(item)
-                doi = item.get("DOI")
-                authors = item.get("author", [])
-                publisher_str = item.get("publisher", "").lower()
-                if not pub_year or not doi or not authors:
-                    continue
-
-                # Check name & institution
-                matched_name, matched_institution = False, False
-
-                for author in authors:
-                    if matched_name_in_author(author, name_query):
-                        matched_name = True
-                        aff_list = author.get("affiliation", [])
-                        # If any affiliation matches institution_name
-                        for aff in aff_list:
-                            if institution_name.lower() in aff.get("name", "").lower():
-                                matched_institution = True
-                                break
-                        # 2) If still not matched, fallback to checking publisher
-                        if not matched_institution:
-                            if institution_name.lower() in publisher_str:
-                                matched_institution = True
-
-                # Format DOI
-                doi_link = f"https://doi.org/{doi}"
-
-                # If within ±5 years
-                if matched_name and matched_institution:
-                    if (scholarship_year - 5 <= pub_year <= scholarship_year + 5):
-                        valid_dois.append({"doi": doi_link, "status": "PAREJA"})
-                    else:
-                        # Matched name and institution but not scholarship year
-                        valid_dois.append({"doi": doi_link, "status": "nombre+institucion"})
-
-                # Always track fallback if name matched, up to 3
-                if matched_name and len(fallback_dois) < 3:
-                    fallback_dois.append({"doi": doi_link, "status": "REVISA"})
-
-                # Stop after collecting 3 valid DOIs
-                if len(valid_dois) >= 3:
-                    break
-    except Exception as e:
-        print(f"Error fetching DOI for {name_query}: {e}")
-
-    # Return valid_dois if we have them, else fallback
-    if valid_dois:
-        return valid_dois[:3]
-    else:
-        return fallback_dois[:3]
-
-# ---------------------------------------------------------------------------
-#                 Helper for partial matching in search_doi_loose
-# ---------------------------------------------------------------------------
-def token_match_score(name_tokens, author_obj):
-    """
-    Returns how many tokens from 'name_tokens' appear in this author's
-    'given' + 'family' name.
-    """
-    given = author_obj.get('given', '').lower()
-    family = author_obj.get('family', '').lower()
-
-    match_count = 0
-    for token in name_tokens:
-        if token in given or token in family:
-            match_count += 1
-    return match_count
-
-
-def search_doi_loose(name_query):
-    """
-    A 'loose' CrossRef search that:
-      1. Splits the name into tokens.
-      2. Gets CrossRef items, sorts them by (match_score, crossref_score).
-      3. Returns up to the top 3 DOIs, each as {"doi": "...", "status": "loose search"}.
-    """
-    # Clean & tokenize
-    query_clean = re.sub(r'[^\w\s]', '', name_query.lower())
-    name_tokens = query_clean.split()
-
-    crossref_url = (
-        "https://api.crossref.org/works"
-        f"?query.author={name_query.replace(' ', '+')}"
-        "&sort=score&order=desc"
-    )
-
-    try:
-        response = requests.get(crossref_url, timeout=20)
-        if response.status_code != 200:
-            print(f"Error {response.status_code} from CrossRef: {response.text}")
-            return []
-
-        items = response.json().get("message", {}).get("items", [])
-        results_scored = []
-
-        for it in items:
-            doi_id = it.get("DOI", "")
-            authors = it.get("author", [])
-            best_score = 0
-
-            for au in authors:
-                score = token_match_score(name_tokens, au)
-                if score > best_score:
-                    best_score = score
-
-            crossref_score = it.get("score", 0)
-            results_scored.append({
-                "doi_id": doi_id,
-                "match_score": best_score,
-                "crossref_score": crossref_score
-            })
-
-        # Sort by match_score desc, then crossref_score desc
-        results_scored.sort(
-            key=lambda x: (x["match_score"], x["crossref_score"]),
-            reverse=True
-        )
-
-        # Return top 3 with consistent format: {"doi": "...", "status": "loose search"}
-        final_results = []
-        for entry in results_scored:
-            if len(final_results) >= 3:
-                break
-            doi_id = entry["doi_id"]
-            if doi_id:
-                final_results.append({
-                    "doi": f"https://doi.org/{doi_id}",
-                    "status": "loose search"
-                })
-
-        return final_results
-
-    except Exception as e:
-        print(f"Error fetching LOOSER DOIs for {name_query}: {e}")
-        return []
