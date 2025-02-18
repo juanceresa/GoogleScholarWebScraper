@@ -21,8 +21,11 @@ scraper_pass = os.getenv("OXYLABS_PASSWORD")
 unblock_user = os.getenv("WEB_UNBLOCK_USERNAME")
 unblock_pass = os.getenv("WEB_UNBLOCK_PASSWORD")
 
-# Web Unblocker Proxy URL
-unblock_proxy = f"http://{unblock_user}:{unblock_pass}@unblock.oxylabs.io:60000"
+proxies = {
+  'http': f'http://{unblock_user}:{unblock_pass}@unblock.oxylabs.io:60000',
+  'https': f'https://{unblock_user}:{unblock_pass}@unblock.oxylabs.io:60000',
+}
+
 
 # Web Scraper API URL
 scraper_api_url = "https://realtime.oxylabs.io/v1/queries"
@@ -52,10 +55,8 @@ for index, row in df.iterrows():
     # Step 1: Search for Google Scholar profile
     scholar_link = search_google_scholar(
         name_query,
-        scraper_api_url,
-        scraper_user,
-        scraper_pass,
-        unblock_proxy
+        unblock_user,
+        unblock_pass,
     )
 
     if scholar_link:

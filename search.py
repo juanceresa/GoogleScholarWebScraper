@@ -2,6 +2,9 @@ import re
 import unidecode
 from crossref.restful import Works, Etiquette
 import requests
+from bs4 import BeautifulSoup
+import base64
+import time
 
 COMMON_INSTITUTION_WORDS = {
     "universidad", "university", "college", "institute", "instituto",
@@ -33,23 +36,20 @@ def spanish_name_match_combined(author, user_full_name, debug=False):
     It requires that:
       - The user's primary first name appears in the author's 'given' field.
       - At least one token from the combined last name appears in the author's 'family' field.
+    (This function is not used in the new strict scoring.)
     """
-    # Parse the user's name
     user_first, paternal, maternal = parse_spanish_name(user_full_name)
     if debug:
         print(f"DEBUG: Parsed user name: first={user_first}, paternal={paternal}, maternal={maternal}")
     if not paternal:
         return False
 
-    # Build the combined last name string.
     combined_last = paternal
     if maternal:
         combined_last += " " + maternal
-    # Normalize: remove accents, lowercase, replace hyphens with spaces.
     combined_last_norm = unidecode.unidecode(combined_last.lower()).replace('-', ' ')
     combined_tokens = combined_last_norm.split()
 
-    # Get author's name fields.
     given  = unidecode.unidecode((author.get('given') or '').lower())
     family = unidecode.unidecode((author.get('family') or '').lower()).replace('-', ' ')
 
@@ -59,14 +59,12 @@ def spanish_name_match_combined(author, user_full_name, debug=False):
             print(f"DEBUG: User primary first: {user_first[0]}")
         print(f"DEBUG: Combined last tokens: {combined_tokens}")
 
-    # Check that the user's primary first name is present in the author's given field.
     if user_first:
         if user_first[0] not in given:
             if debug:
                 print(f"DEBUG: FAIL => first token '{user_first[0]}' not in '{given}'")
             return False
 
-    # Require that at least one token from the combined last name is found in family.
     match_count = sum(1 for token in combined_tokens if token in family)
     if debug:
         print(f"DEBUG: Found {match_count} of {len(combined_tokens)} last name tokens in '{family}'")
@@ -87,9 +85,9 @@ def tokenize_name_fields(*fields):
       tokenize_name_fields("Rebeca", "acin-perez") -> ["rebeca", "acin", "perez"]
     """
     combined = " ".join(fields).lower()
-    combined = unidecode.unidecode(combined)  # Remove accents
-    combined = combined.replace("-", " ")     # Replace hyphens with space
-    combined = re.sub(r"[^\w\s]", "", combined) # Remove punctuation
+    combined = unidecode.unidecode(combined)
+    combined = combined.replace("-", " ")
+    combined = re.sub(r"[^\w\s]", "", combined)
     tokens = combined.split()
     return tokens
 
@@ -184,17 +182,26 @@ def check_created_year_in_range(item, scholarship_year, delta=5):
 
 def compute_similarity_score(item, full_name, institution_name, scholarship_year, debug=False):
     """
-    Computes a score:
-      +1 for a name match (using our Spanish combined-name match),
-      +1 if the affiliation or publisher matches the institution,
+    Computes a score as follows:
+      +1 if a perfect name match is found—that is, if all tokens from full_name (the query)
+         are present in the combined tokens from an author's 'given' and 'family' fields.
+      +1 if the affiliation or publisher matches the institution.
       +1 if the created year is within ±5 years of scholarship_year.
-    If no name match is found, returns -999.
+    If no perfect name match is found for any author, returns -999.
     """
-    if not any_author_matches_name(item, full_name, debug=debug):
+    query_tokens = set(tokenize_name_fields(full_name))
+    perfect_match = False
+    for au in item.get("author", []):
+        author_tokens = set(tokenize_name_fields(au.get("given", ""), au.get("family", "")))
+        if query_tokens.issubset(author_tokens):
+            perfect_match = True
+            break
+    if not perfect_match:
         if debug:
-            print("DEBUG: Name did not match; score = -999")
+            print("DEBUG: Perfect name match not found; score = -999")
         return -999
-    score = 1  # name match
+
+    score = 1  # perfect name match
     if check_affiliation_or_publisher(item, institution_name):
         score += 1
     if check_created_year_in_range(item, scholarship_year, delta=5):
@@ -209,32 +216,27 @@ def search_doi(name_query, given_name, scholarship_year, institution_name, debug
     We build the query using the combined last names only, then score each item
     (using the full name as 'given_name apellido1 apellido2').
 
-    Returns ONLY ONE DOI:
-      - If any item has a similarity score >= 2, return the one with the highest score.
-      - Otherwise, fallback to an exact token match (combining the author's 'given'
-        and 'family' fields with hyphens removed) and return that DOI.
+    Returns ONLY ONE DOI (as a list with one dictionary):
+      - If any item has a similarity score >= 2, returns the one with the highest score.
+      - Otherwise, falls back to an exact token match and returns that DOI.
       - If none are found, returns None.
     """
-    # Build the combined last name query from 'name_query'
     _, apellido1_parsed, apellido2_parsed = parse_spanish_name(name_query)
     last_name_query = apellido1_parsed if apellido1_parsed else ""
     if apellido2_parsed:
         last_name_query += " " + apellido2_parsed
 
-    # Build full name for matching (e.g., "Rebeca Acin Perez")
     full_name = f"{given_name} {last_name_query}".strip()
 
     my_etiquette = Etiquette(
         'GoogleScholarWebScraper', '1.0',
         'https://github.com/juanceresa/GoogleScholarWebScraper',
-        'jcere@umich.edu'
     )
     works = Works(etiquette=my_etiquette)
 
     if debug:
         print(f"DEBUG: CROSSREF => searching for author last names='{last_name_query}' (limit 100 rows)...")
 
-    # Query CrossRef (sample up to 100 results)
     results = works.query(author=last_name_query).sample(100)
 
     scored_items = []       # list of tuples: (score, item)
@@ -246,21 +248,17 @@ def search_doi(name_query, given_name, scholarship_year, institution_name, debug
         if debug:
             print(f"DEBUG: Checking item => DOI='{item.get('DOI')}', TITLE='{title_str}'")
 
-        # Compute similarity score
         sc = compute_similarity_score(item, full_name, institution_name, scholarship_year, debug=debug)
         if sc > 0:
             scored_items.append((sc, item))
 
-        # Check for exact token match based on combined given+family fields
         authors = item.get("author", [])
         for au in authors:
             if name_tokens_exact_match(au, full_name, debug=debug):
                 exact_match_items.append(item)
                 break
 
-    # Sort scored items by descending score
     scored_items.sort(key=lambda x: x[0], reverse=True)
-    # Filter for items with score >= 2
     best_scored = [(sc, it) for (sc, it) in scored_items if sc >= 2]
 
     if best_scored:
@@ -271,7 +269,6 @@ def search_doi(name_query, given_name, scholarship_year, institution_name, debug
         else:
             return None
 
-    # Fallback: if no item with score >= 2, use the exact token match approach.
     if exact_match_items:
         fallback_item = exact_match_items[0]
         doi_val = fallback_item.get("DOI")
@@ -282,57 +279,57 @@ def search_doi(name_query, given_name, scholarship_year, institution_name, debug
 
     return None
 
-def search_google_scholar(name_query, scraper_api_url, scraper_user, scraper_pass, unblock_proxy):
-    """
-    Searches Google Scholar for a user profile using Oxylabs Real-Time Crawler.
-    Returns a profile URL if found.
-    """
-    # We do a simple check for the first word of the name or the entire name.
-    name_lower = name_query.lower()
-    first_word = name_lower.split()[0]
 
+def search_google_scholar(name_query, scraper_user, scraper_pass):
+    """
+    Searches Google Scholar for an author profile using Oxylabs Web Unblocker.
+    Returns the full profile URL if found (only if the link includes a unique user identifier).
+    """
+    # Construct the search URL.
     search_url = f"https://scholar.google.com/scholar?q={name_query.replace(' ', '+')}"
-    payload = {"source": "google", "url": search_url, "parse": True}
+
+    # Define Web Unblocker proxy settings.
+    proxies = {
+        'http': f'http://{scraper_user}:{scraper_pass}@unblock.oxylabs.io:60000',
+        'https': f'https://{scraper_user}:{scraper_pass}@unblock.oxylabs.io:60000',
+    }
 
     try:
-        response = requests.post(
-            scraper_api_url,
-            auth=(scraper_user, scraper_pass),
-            json=payload,
-            proxies={"http": unblock_proxy, "https": unblock_proxy},
-            verify=False,
-            timeout=20
-        )
-        if response.status_code == 200:
-            data = response.json()
-            results = data.get("data", {}).get("results", [])
-            for result in results:
-                title = result.get("title", "")
-                snippet = result.get("snippet", "")
-                link = result.get("link", "")
+        # Send the request via the Web Unblocker.
+        response = requests.get(search_url, proxies=proxies, verify=False, timeout=20)
+        response.raise_for_status()
 
-                # Convert to lowercase for easier matching
-                title_lower = title.lower()
-                snippet_lower = snippet.lower()
+        # Parse the returned HTML.
+        soup = BeautifulSoup(response.text, "html.parser")
+        # Uncomment the next line to inspect the HTML structure for debugging:
+        # print(soup.prettify())
 
-                # Check if "user profiles for" appears in the title or snippet
-                if "user profiles for" in title_lower or "user profiles for" in snippet_lower:
-                    if name_lower in title_lower or name_lower in snippet_lower or first_word in snippet_lower:
-                        possible_links = set()
-                        if link:
-                            possible_links.add(link)
-                        for sub in result.get("inlineLinks", []):
-                            if sub.get("link"):
-                                possible_links.add(sub["link"])
-                        for sub in result.get("relatedUrls", []):
-                            if sub.get("link"):
-                                possible_links.add(sub["link"])
-                        for plink in possible_links:
-                            if "scholar.google.com/citations?" in plink:
-                                return plink
-                if "scholar.google.com/citations?" in link:
-                    return link
+        profile_link = None
+
+        # Look for all anchor tags with an href attribute.
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            # We want links that start with "/citations" AND contain a user parameter.
+            if href.startswith("/citations") and "user=" in href:
+                classes = a.get("class", [])
+                # Check that the anchor has the expected profile button class.
+                if "gs_btnPRO" in classes:
+                    profile_link = href
+                    break
+
+        if profile_link:
+            # If the URL is relative, prepend the base URL.
+            if profile_link.startswith("/"):
+                profile_link = "https://scholar.google.com" + profile_link
+            return profile_link
+        else:
+            print(f"No valid profile link found for '{name_query}'")
+            return None
+
+    except requests.exceptions.HTTPError as err:
+        print(f"HTTP Error: {err}")
+        print(f"Response content: {response.content.decode()}")
+        return None
     except Exception as e:
-        print(f"Error fetching Google Scholar profile for {name_query}: {e}")
-    print(f"No profile found for {name_query}")
-    return None
+        print(f"Error fetching Google Scholar profile for '{name_query}': {e}")
+        return None
